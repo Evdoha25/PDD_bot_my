@@ -8,9 +8,13 @@ A Telegram bot for practicing Russian driving theory exams (ПДД - Прави�
 - **Interactive UI** with inline buttons for answers
 - **Progress tracking** with visual progress bar
 - **Instant feedback** - correct/incorrect answer notifications
-- **End-of-ticket statistics** showing score and performance
-- **Session management** with automatic cleanup (TTL-based)
-- **Horizontal scaling** support via PM2 clustering or Bull Queue (Redis)
+- **End-of-ticket statistics** showing score, performance, and time spent
+- **Session management** with LRU cache and automatic TTL-based cleanup
+- **Rate limiting** to prevent abuse (10 requests/minute per user)
+- **Health check HTTP endpoint** for monitoring and load balancers
+- **Memory monitoring** with automatic alerts at 70%/80% thresholds
+- **Image caching** for optimized performance
+- **Horizontal scaling** support via PM2 clustering or native Node.js cluster
 
 ## Prerequisites
 
@@ -53,24 +57,38 @@ npm start
 npm run cluster
 ```
 
+**Production mode with native Node.js clustering:**
+```bash
+npm run cluster:native
+```
+
 ## Project Structure
 
 ```
 /workspace
-├── bot.js                  # Main bot entry point
-├── pdd_questions.json      # Question database (800 questions)
-├── package.json            # Dependencies and scripts
-├── ecosystem.config.js     # PM2 cluster configuration
-├── .env.example            # Environment template
-├── /images                 # Question images (optional)
+├── bot.js                    # Main bot entry point
+├── cluster.js                # Native Node.js clustering setup
+├── pdd_questions.json        # Question database (800 questions)
+├── package.json              # Dependencies and scripts
+├── ecosystem.config.js       # PM2 cluster configuration
+├── .env.example              # Environment template
+├── /images                   # Question images (optional)
+├── /src
+│   ├── questionService.js    # Question retrieval and validation
+│   ├── imageService.js       # Image loading with caching
+│   ├── statistics.js         # Results calculation
+│   ├── healthCheck.js        # HTTP health check server
+│   └── memoryMonitor.js      # Memory usage monitoring
 ├── /queues
-│   └── queueManager.js     # Bull Queue manager
+│   └── queueManager.js       # Bull Queue manager (Redis)
 ├── /utils
-│   ├── sessionManager.js   # Session management with TTL
-│   ├── progressBar.js      # Progress bar generation
-│   └── keyboard.js         # Telegram keyboard generation
+│   ├── sessionManager.js     # LRU session management with TTL
+│   ├── progressBar.js        # Progress bar generation
+│   ├── keyboard.js           # Telegram keyboard generation
+│   ├── cache.js              # LRU and image cache utilities
+│   └── rateLimiter.js        # Request rate limiting
 ├── /scripts
-│   └── generateQuestions.js # Sample question generator
+│   └── generateQuestions.js  # Sample question generator
 └── README.md
 ```
 
@@ -80,11 +98,11 @@ npm run cluster
 |---------|-------------|
 | `/start` | Start the bot and show ticket selection |
 | `/help` | Show help information |
-| `/stats` | Show bot statistics (admin) |
+| `/stats` | Show bot statistics (includes memory, sessions, cache) |
 
 ## User Flow
 
-1. **Start**: User sends `/start` → bot displays ticket selection (buttons 1-40)
+1. **Start**: User sends `/start` → bot displays ticket selection (4 columns × 10 rows)
 2. **Ticket Selection**: User taps a ticket number → bot loads first question
 3. **Question Display**:
    - Shows question text + image (if available)
@@ -94,7 +112,7 @@ npm run cluster
    - User taps inline button → bot validates answer
    - Instant popup: "✅ Правильно!" or "❌ Неправильно! Правильный ответ: [option]"
 5. **Navigation**: Auto-advances to next question after feedback
-6. **Completion**: After last question → displays statistics with restart options
+6. **Completion**: After last question → displays statistics with time spent and restart options
 
 ## Configuration
 
@@ -104,6 +122,13 @@ npm run cluster
 |----------|-------------|---------|
 | `TELEGRAM_BOT_TOKEN` | Your Telegram bot token | **Required** |
 | `SESSION_TTL_MINUTES` | Session expiration time | `30` |
+| `MAX_SESSIONS` | Maximum concurrent sessions (LRU) | `5000` |
+| `RATE_LIMIT_REQUESTS` | Max requests per window | `10` |
+| `RATE_LIMIT_WINDOW_MS` | Rate limit window in ms | `60000` |
+| `HEALTH_CHECK_PORT` | HTTP health check port | `3000` |
+| `MEMORY_WARNING_THRESHOLD` | Memory warning % | `70` |
+| `MEMORY_CRITICAL_THRESHOLD` | Memory critical % | `80` |
+| `MAX_WORKERS` | Max cluster workers | `4` |
 | `REDIS_HOST` | Redis server host | `localhost` |
 | `REDIS_PORT` | Redis server port | `6379` |
 | `REDIS_PASSWORD` | Redis password | *empty* |
@@ -117,22 +142,36 @@ Edit `ecosystem.config.js` to adjust:
 
 ## Scaling Options
 
-### Option 1: PM2 Clustering (Simpler)
+### Option 1: Native Node.js Clustering
 
-No Redis required. Uses Node.js cluster module.
+Uses built-in Node.js cluster module. No PM2 required.
+
+```bash
+npm run cluster:native
+```
+
+### Option 2: PM2 Clustering (Recommended for Production)
+
+More features: process management, logs, monitoring.
 
 ```bash
 # Start cluster
 npm run cluster
+
+# View status
+npm run cluster:status
 
 # View logs
 npm run cluster:logs
 
 # Stop cluster
 npm run cluster:stop
+
+# Delete from PM2
+npm run cluster:delete
 ```
 
-### Option 2: Bull Queue with Redis (Advanced)
+### Option 3: Bull Queue with Redis (Advanced)
 
 For distributed task processing across multiple servers.
 
@@ -150,6 +189,49 @@ REDIS_PORT=6379
 ```
 
 3. Start bot - it will auto-detect Redis and use Bull queues.
+
+## Health Check & Monitoring
+
+### HTTP Endpoints
+
+The bot exposes health check endpoints (default port 3000):
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health status, uptime, PID |
+| `GET /ready` | Readiness probe for k8s |
+| `GET /stats` | Full statistics (sessions, memory, cache) |
+| `GET /memory` | Detailed memory usage |
+
+```bash
+# Quick health check
+npm run health
+
+# Full stats
+npm run stats
+
+# Or use curl directly
+curl http://localhost:3000/health
+curl http://localhost:3000/stats
+curl http://localhost:3000/memory
+```
+
+### Memory Monitoring
+
+The bot monitors memory usage and:
+- Logs warnings at 70% heap usage
+- Triggers garbage collection at 80% (if `--expose-gc` flag is set)
+- Clears image cache on critical memory situations
+
+### Telegram /stats Command
+
+Send `/stats` to the bot for real-time statistics:
+- Active sessions and utilization
+- Question database info
+- Memory usage and status
+- Image cache hit rate
+- Rate limiter status
+- Queue status (if Redis enabled)
 
 ## Adding Real Questions
 
@@ -177,47 +259,49 @@ Place images in the `/images` folder with naming format:
 
 Supported formats: JPG, PNG, GIF
 
+Images are automatically cached in memory for better performance.
+
 ## Performance
 
-Designed for 2,000-3,000 daily active users (~50 concurrent):
+Designed for 2,000-3,000 daily active users:
 
-- **Memory**: ~50MB per instance
+- **Memory**: ~50-100MB per instance
 - **Response time**: < 2 seconds
+- **Session capacity**: 5,000 concurrent sessions (LRU eviction)
+- **Rate limiting**: 10 requests/minute per user
 - **Session cleanup**: Automatic every 5 minutes
-- **Stateless design**: Easy horizontal scaling
+- **Image caching**: Up to 50MB of images cached in memory
 
-## Monitoring
+### Memory Estimates
 
-### Health Check
-
-The bot provides a `/stats` command for basic monitoring:
-- Active sessions count
-- Queue statistics (if Redis enabled)
-- Total questions/tickets loaded
-
-### Logs
-
-With PM2:
-```bash
-pm2 logs pdd-trainer-bot
-```
-
-Log files location:
-- `logs/out.log` - Standard output
-- `logs/err.log` - Error output
+| Component | Memory |
+|-----------|--------|
+| Session data (5000 users) | ~10MB |
+| Questions JSON | ~5MB |
+| Image cache (max) | ~50MB |
+| Node.js overhead | ~30MB |
+| **Total per worker** | ~100MB |
 
 ## Development
 
 ### Regenerate Sample Questions
 
 ```bash
-node scripts/generateQuestions.js
+npm run generate-questions
 ```
 
-### Run Tests
+### Project Scripts
 
 ```bash
-npm test
+npm start              # Start single instance
+npm run dev            # Development mode
+npm run cluster        # Start PM2 cluster
+npm run cluster:native # Start native cluster
+npm run cluster:stop   # Stop PM2 cluster
+npm run cluster:logs   # View PM2 logs
+npm run cluster:status # View PM2 status
+npm run health         # Check health endpoint
+npm run stats          # Check stats endpoint
 ```
 
 ## Troubleshooting
@@ -230,15 +314,28 @@ npm test
 
 ### High memory usage
 
-1. Reduce `SESSION_TTL_MINUTES`
-2. Increase cleanup frequency in `sessionManager.js`
-3. Add more PM2 instances with lower memory limits
+1. Reduce `MAX_SESSIONS`
+2. Reduce image cache size in `imageService.js`
+3. Lower `MEMORY_CRITICAL_THRESHOLD` for earlier cleanup
+4. Add more PM2 instances with lower memory limits
+
+### Rate limit errors
+
+Users seeing "Too many requests" message:
+1. This is working as intended to prevent abuse
+2. Adjust `RATE_LIMIT_REQUESTS` if needed
+3. Default: 10 requests per 60 seconds
 
 ### Redis connection issues
 
 1. Verify Redis is running: `redis-cli ping`
 2. Check Redis credentials in `.env`
 3. Bot works without Redis (uses direct processing)
+
+### Health check port in use
+
+If port 3000 is busy, the server automatically tries the next port.
+Or set a different port: `HEALTH_CHECK_PORT=3001`
 
 ## License
 
