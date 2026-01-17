@@ -1,0 +1,36 @@
+{
+  "name": "pdd-trainer-bot",
+  "version": "1.0.0",
+  "description": "Telegram Bot for PDD (Russian driving theory) training",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "node bot.js",
+    "cluster": "pm2 start ecosystem.config.js",
+    "cluster:stop": "pm2 stop pdd-trainer-bot",
+    "cluster:delete": "pm2 delete pdd-trainer-bot",
+    "cluster:logs": "pm2 logs pdd-trainer-bot"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "pdd",
+    "driving",
+    "russia",
+    "training"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "bull": "^4.12.2",
+    "dotenv": "^16.3.1",
+    "ioredis": "^5.3.2",
+    "node-telegram-bot-api": "^0.64.0"
+  },
+  "devDependencies": {
+    "pm2": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
