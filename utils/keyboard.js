@@ -3,12 +3,13 @@
  */
 
 /**
- * Generate ticket selection keyboard (40 tickets, 8 per row)
+ * Generate ticket selection keyboard (40 tickets, 4 columns × 10 rows)
+ * Layout optimized for mobile display as per PRD requirements
  * @returns {Object} Reply keyboard markup
  */
 function generateTicketKeyboard() {
   const keyboard = [];
-  const ticketsPerRow = 8;
+  const ticketsPerRow = 4;
   const totalTickets = 40;
 
   for (let i = 0; i < totalTickets; i += ticketsPerRow) {

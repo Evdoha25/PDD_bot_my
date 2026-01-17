@@ -7,7 +7,8 @@ node_modules/
 .env.*.local
 
 # Logs
-logs/
+logs/*
+!logs/.gitkeep
 *.log
 npm-debug.log*
 

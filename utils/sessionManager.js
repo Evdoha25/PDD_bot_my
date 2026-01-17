@@ -1,12 +1,19 @@
 /**
- * Session Manager with TTL-based cleanup
+ * Session Manager with TTL-based cleanup and LRU eviction
  * Stores user sessions in memory with automatic expiration
+ * Implements LRU (Least Recently Used) cache pattern for memory efficiency
  */
 
 class SessionManager {
-  constructor(ttlMinutes = 30) {
+  /**
+   * Create a session manager
+   * @param {number} ttlMinutes - Session TTL in minutes (default 30)
+   * @param {number} maxSessions - Maximum sessions to store (default 5000)
+   */
+  constructor(ttlMinutes = 30, maxSessions = 5000) {
     this.sessions = new Map();
     this.ttlMs = ttlMinutes * 60 * 1000;
+    this.maxSessions = maxSessions;
     
     // Start cleanup interval (runs every 5 minutes)
     this.cleanupInterval = setInterval(() => {
@@ -16,11 +23,24 @@ class SessionManager {
 
   /**
    * Create or update a user session
+   * Uses LRU eviction when at capacity
    * @param {number} userId - Telegram user ID
    * @param {Object} data - Session data
    * @returns {Object} The session object
    */
   set(userId, data) {
+    // Remove existing to update position in Map (LRU behavior)
+    if (this.sessions.has(userId)) {
+      this.sessions.delete(userId);
+    }
+    
+    // Evict oldest sessions if at capacity
+    while (this.sessions.size >= this.maxSessions) {
+      const oldestKey = this.sessions.keys().next().value;
+      this.sessions.delete(oldestKey);
+      console.log(`[SessionManager] Evicted session for user ${oldestKey} (LRU)`);
+    }
+    
     const session = {
       userId,
       ...data,
@@ -114,7 +134,9 @@ class SessionManager {
   getStats() {
     return {
       activeSessions: this.sessions.size,
-      ttlMinutes: this.ttlMs / 60 / 1000
+      maxSessions: this.maxSessions,
+      ttlMinutes: this.ttlMs / 60 / 1000,
+      utilizationPercent: Math.round((this.sessions.size / this.maxSessions) * 100)
     };
   }
 

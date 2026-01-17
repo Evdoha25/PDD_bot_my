@@ -6,10 +6,15 @@
   "scripts": {
     "start": "node bot.js",
     "dev": "node bot.js",
+    "cluster:native": "node cluster.js",
     "cluster": "pm2 start ecosystem.config.js",
     "cluster:stop": "pm2 stop pdd-trainer-bot",
     "cluster:delete": "pm2 delete pdd-trainer-bot",
-    "cluster:logs": "pm2 logs pdd-trainer-bot"
+    "cluster:logs": "pm2 logs pdd-trainer-bot",
+    "cluster:status": "pm2 status pdd-trainer-bot",
+    "generate-questions": "node scripts/generateQuestions.js",
+    "health": "curl -s http://localhost:3000/health | node -e \"const d=require('fs').readFileSync(0,'utf8');console.log(JSON.parse(d))\"",
+    "stats": "curl -s http://localhost:3000/stats | node -e \"const d=require('fs').readFileSync(0,'utf8');console.log(JSON.parse(d))\""
   },
   "keywords": [
     "telegram",

@@ -6,18 +6,31 @@
 require('dotenv').config();
 
 const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs');
 const path = require('path');
 
 // Import utilities
 const SessionManager = require('./utils/sessionManager');
 const QueueManager = require('./queues/queueManager');
-const { generateProgressBar, generateProgressText, generateStatistics } = require('./utils/progressBar');
+const RateLimiter = require('./utils/rateLimiter');
+const { generateProgressBar, generateProgressText } = require('./utils/progressBar');
 const { generateTicketKeyboard, generateAnswerKeyboard, generateCompletionKeyboard, removeKeyboard } = require('./utils/keyboard');
+
+// Import services
+const QuestionService = require('./src/questionService');
+const ImageService = require('./src/imageService');
+const HealthCheckServer = require('./src/healthCheck');
+const MemoryMonitor = require('./src/memoryMonitor');
+const { generateCompletionStats } = require('./src/statistics');
 
 // Configuration
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SESSION_TTL = parseInt(process.env.SESSION_TTL_MINUTES) || 30;
+const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS) || 5000;
+const RATE_LIMIT_REQUESTS = parseInt(process.env.RATE_LIMIT_REQUESTS) || 10;
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 60000;
+const HEALTH_CHECK_PORT = parseInt(process.env.HEALTH_CHECK_PORT) || 3000;
+const MEMORY_WARNING_THRESHOLD = parseInt(process.env.MEMORY_WARNING_THRESHOLD) || 70;
+const MEMORY_CRITICAL_THRESHOLD = parseInt(process.env.MEMORY_CRITICAL_THRESHOLD) || 80;
 
 // Validate token
 if (!BOT_TOKEN) {
@@ -26,37 +39,35 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// Load questions data
-let questions = [];
-try {
-  const questionsPath = path.join(__dirname, 'pdd_questions.json');
-  const questionsData = fs.readFileSync(questionsPath, 'utf8');
-  questions = JSON.parse(questionsData);
-  console.log(`[Bot] Loaded ${questions.length} questions`);
-} catch (error) {
-  console.error('Error loading questions:', error.message);
+// Initialize Question Service
+const questionService = new QuestionService();
+const questionsPath = path.join(__dirname, 'pdd_questions.json');
+if (!questionService.load(questionsPath)) {
+  console.error('Failed to load questions. Exiting.');
   process.exit(1);
 }
 
-// Create indexes for fast question lookup
-const questionsByTicket = {};
-const questionById = {};
+// Initialize Image Service
+const imageService = new ImageService(__dirname);
 
-questions.forEach(q => {
-  if (!questionsByTicket[q.ticketNumber]) {
-    questionsByTicket[q.ticketNumber] = [];
-  }
-  questionsByTicket[q.ticketNumber].push(q);
-  questionById[q.questionId] = q;
-});
+// Initialize Session Manager with LRU cache
+const sessionManager = new SessionManager(SESSION_TTL, MAX_SESSIONS);
 
-console.log(`[Bot] Indexed ${Object.keys(questionsByTicket).length} tickets`);
+// Initialize Rate Limiter
+const rateLimiter = new RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW_MS);
 
-// Initialize session manager
-const sessionManager = new SessionManager(SESSION_TTL);
-
-// Initialize queue manager
+// Initialize Queue Manager
 const queueManager = new QueueManager();
+
+// Initialize Health Check Server
+const healthServer = new HealthCheckServer(HEALTH_CHECK_PORT);
+
+// Initialize Memory Monitor
+const memoryMonitor = new MemoryMonitor({
+  warningThreshold: MEMORY_WARNING_THRESHOLD,
+  criticalThreshold: MEMORY_CRITICAL_THRESHOLD,
+  checkIntervalMs: 60000
+});
 
 // Initialize Telegram bot
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
@@ -66,12 +77,28 @@ console.log('[Bot] Starting PDD Trainer Bot...');
 // ==================== Helper Functions ====================
 
 /**
- * Get questions for a specific ticket
- * @param {number} ticketNumber - Ticket number (1-40)
- * @returns {Array} Array of questions
+ * Check rate limit for a user
+ * @param {number} userId - User ID
+ * @param {string} callbackQueryId - Callback query ID (optional)
+ * @returns {boolean} Whether the request is allowed
  */
-function getTicketQuestions(ticketNumber) {
-  return questionsByTicket[ticketNumber] || [];
+async function checkRateLimit(userId, callbackQueryId = null) {
+  const status = rateLimiter.hit(userId);
+  
+  if (!status.allowed) {
+    const message = `⏳ Слишком много запросов. Подождите ${status.resetIn} сек.`;
+    
+    if (callbackQueryId) {
+      await bot.answerCallbackQuery(callbackQueryId, {
+        text: message,
+        show_alert: true
+      });
+    }
+    
+    return false;
+  }
+  
+  return true;
 }
 
 /**
@@ -80,8 +107,7 @@ function getTicketQuestions(ticketNumber) {
  * @returns {Object|null} Current question or null
  */
 function getCurrentQuestion(session) {
-  const ticketQuestions = getTicketQuestions(session.currentTicket);
-  return ticketQuestions[session.currentQuestion - 1] || null;
+  return questionService.getQuestion(session.currentTicket, session.currentQuestion);
 }
 
 /**
@@ -91,8 +117,7 @@ function getCurrentQuestion(session) {
  * @param {Object} session - User session
  */
 async function sendQuestion(chatId, question, session) {
-  const ticketQuestions = getTicketQuestions(session.currentTicket);
-  const totalQuestions = ticketQuestions.length;
+  const totalQuestions = questionService.getTicketQuestionCount(session.currentTicket);
   
   // Generate progress bar
   const progressBar = generateProgressBar(session.currentQuestion, totalQuestions);
@@ -104,11 +129,10 @@ async function sendQuestion(chatId, question, session) {
   // Prepare answer keyboard
   const keyboard = generateAnswerKeyboard(question.options, question.questionId);
   
-  // Check if image exists
-  const imagePath = path.join(__dirname, question.imageUrl);
-  
   try {
-    if (fs.existsSync(imagePath)) {
+    // Try to get image from cache or filesystem
+    if (question.imageUrl && imageService.imageExists(question.imageUrl)) {
+      const imagePath = imageService.getFullPath(question.imageUrl);
       // Send photo with caption
       await bot.sendPhoto(chatId, imagePath, {
         caption: messageText,
@@ -149,13 +173,13 @@ async function sendTicketSelection(chatId) {
  * @param {number} ticketNumber - Ticket number to start
  */
 async function startTicket(chatId, userId, ticketNumber) {
-  const ticketQuestions = getTicketQuestions(ticketNumber);
-  
-  if (ticketQuestions.length === 0) {
+  if (!questionService.ticketExists(ticketNumber)) {
     await bot.sendMessage(chatId, `❌ Билет ${ticketNumber} не найден. Пожалуйста, выберите другой билет.`);
     await sendTicketSelection(chatId);
     return;
   }
+  
+  const ticketQuestions = questionService.getTicketQuestions(ticketNumber);
   
   // Create new session
   const session = sessionManager.set(userId, {
@@ -165,6 +189,9 @@ async function startTicket(chatId, userId, ticketNumber) {
     incorrectAnswers: 0,
     startTime: new Date().toISOString()
   });
+  
+  // Preload images for this ticket (optional optimization)
+  imageService.preloadTicketImages(ticketQuestions);
   
   // Remove reply keyboard and send confirmation
   await bot.sendMessage(chatId, `📋 Билет ${ticketNumber}\nВсего вопросов: ${ticketQuestions.length}\n\nНачинаем!`, {
@@ -195,9 +222,10 @@ async function processAnswer(chatId, userId, questionId, answerIndex, callbackQu
     return;
   }
   
-  const question = questionById[questionId];
+  // Validate answer using question service
+  const validation = questionService.validateAnswer(questionId, answerIndex);
   
-  if (!question) {
+  if (validation.error) {
     await bot.answerCallbackQuery(callbackQueryId, {
       text: '❌ Вопрос не найден',
       show_alert: true
@@ -205,11 +233,8 @@ async function processAnswer(chatId, userId, questionId, answerIndex, callbackQu
     return;
   }
   
-  // Check if answer is correct
-  const isCorrect = answerIndex === question.correctAnswerIndex;
-  
   // Update session
-  if (isCorrect) {
+  if (validation.isCorrect) {
     session.correctAnswers++;
     await bot.answerCallbackQuery(callbackQueryId, {
       text: '✅ Правильно!',
@@ -217,9 +242,8 @@ async function processAnswer(chatId, userId, questionId, answerIndex, callbackQu
     });
   } else {
     session.incorrectAnswers++;
-    const correctAnswer = question.options[question.correctAnswerIndex];
     await bot.answerCallbackQuery(callbackQueryId, {
-      text: `❌ Неправильно!\n\nПравильный ответ:\n${correctAnswer}`,
+      text: `❌ Неправильно!\n\nПравильный ответ:\n${validation.correctAnswer}`,
       show_alert: true
     });
   }
@@ -229,15 +253,16 @@ async function processAnswer(chatId, userId, questionId, answerIndex, callbackQu
   sessionManager.update(userId, session);
   
   // Check if ticket is completed
-  const ticketQuestions = getTicketQuestions(session.currentTicket);
+  const totalQuestions = questionService.getTicketQuestionCount(session.currentTicket);
   
-  if (session.currentQuestion > ticketQuestions.length) {
+  if (session.currentQuestion > totalQuestions) {
     // Ticket completed - show statistics
-    const stats = generateStatistics(
-      session.correctAnswers,
-      session.incorrectAnswers,
-      session.currentTicket
-    );
+    const stats = generateCompletionStats({
+      correct: session.correctAnswers,
+      incorrect: session.incorrectAnswers,
+      ticketNumber: session.currentTicket,
+      startTime: session.startTime
+    });
     
     await bot.sendMessage(chatId, stats, {
       reply_markup: generateCompletionKeyboard(session.currentTicket)
@@ -291,14 +316,42 @@ bot.onText(/\/stats/, async (msg) => {
   const chatId = msg.chat.id;
   
   const sessionStats = sessionManager.getStats();
+  const questionStats = questionService.getStats();
+  const imageStats = imageService.getStats();
+  const memoryStats = memoryMonitor.getStats();
+  const rateLimitStats = rateLimiter.getStats();
   const queueStats = await queueManager.getStats();
   
   let statsText = '📊 *Статистика бота*\n\n';
-  statsText += `👥 Активные сессии: ${sessionStats.activeSessions}\n`;
-  statsText += `⏱ TTL сессии: ${sessionStats.ttlMinutes} мин\n`;
-  statsText += `📚 Всего вопросов: ${questions.length}\n`;
-  statsText += `📋 Всего билетов: ${Object.keys(questionsByTicket).length}\n\n`;
   
+  // Session stats
+  statsText += '*Сессии:*\n';
+  statsText += `👥 Активные: ${sessionStats.activeSessions}/${sessionStats.maxSessions}\n`;
+  statsText += `⏱ TTL: ${sessionStats.ttlMinutes} мин\n`;
+  statsText += `📈 Использование: ${sessionStats.utilizationPercent}%\n\n`;
+  
+  // Question stats
+  statsText += '*Вопросы:*\n';
+  statsText += `📚 Всего: ${questionStats.totalQuestions}\n`;
+  statsText += `📋 Билетов: ${questionStats.totalTickets}\n\n`;
+  
+  // Memory stats
+  statsText += '*Память:*\n';
+  statsText += `💾 Heap: ${memoryStats.process.heapUsedMB}/${memoryStats.process.heapTotalMB} MB\n`;
+  statsText += `📊 Статус: ${memoryStats.status}\n\n`;
+  
+  // Image cache stats
+  statsText += '*Кэш изображений:*\n';
+  statsText += `🖼 Файлов: ${imageStats.cache.itemCount}\n`;
+  statsText += `💿 Размер: ${imageStats.cache.currentSizeMB}/${imageStats.cache.maxSizeMB} MB\n`;
+  statsText += `🎯 Hit rate: ${imageStats.hitRate}\n\n`;
+  
+  // Rate limiter stats
+  statsText += '*Rate Limiter:*\n';
+  statsText += `👤 Отслеживается: ${rateLimitStats.trackedUsers} пользователей\n`;
+  statsText += `⚡ Лимит: ${rateLimitStats.maxRequests}/${rateLimitStats.windowSeconds}сек\n\n`;
+  
+  // Queue stats
   if (queueStats.enabled) {
     statsText += '*Очереди (Redis):*\n';
     statsText += `📨 Сообщения: ${JSON.stringify(queueStats.messages)}\n`;
@@ -345,6 +398,11 @@ bot.on('callback_query', async (query) => {
   const data = query.data;
   
   try {
+    // Check rate limit
+    if (!await checkRateLimit(userId, query.id)) {
+      return;
+    }
+    
     // Handle answer callbacks
     if (data.startsWith('answer_')) {
       const parts = data.split('_');
@@ -389,11 +447,23 @@ bot.on('error', (error) => {
 async function shutdown(signal) {
   console.log(`\n[Bot] Received ${signal}. Shutting down gracefully...`);
   
+  // Set health check to unhealthy
+  healthServer.setHealthy(false);
+  
   // Stop polling
   await bot.stopPolling();
   
+  // Stop memory monitor
+  memoryMonitor.stop();
+  
+  // Stop rate limiter
+  rateLimiter.destroy();
+  
   // Clean up session manager
   sessionManager.destroy();
+  
+  // Stop health check server
+  await healthServer.stop();
   
   // Close queue connections
   await queueManager.shutdown();
@@ -408,6 +478,36 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 // ==================== Initialization ====================
 
 async function init() {
+  // Set up health check stats provider
+  healthServer.setStatsProvider(() => ({
+    sessions: sessionManager.getStats(),
+    questions: questionService.getStats(),
+    images: imageService.getStats(),
+    memory: memoryMonitor.getStats(),
+    rateLimit: rateLimiter.getStats()
+  }));
+  
+  // Start health check server
+  try {
+    await healthServer.start();
+  } catch (error) {
+    console.warn('[Bot] Health check server failed to start:', error.message);
+  }
+  
+  // Start memory monitor
+  memoryMonitor.setWarningHandler((stats) => {
+    console.warn(`[Bot] Memory warning: ${stats.usedPercent}% - consider cleanup`);
+  });
+  
+  memoryMonitor.setCriticalHandler((stats) => {
+    console.error(`[Bot] Memory critical: ${stats.usedPercent}% - triggering GC`);
+    memoryMonitor.forceGC();
+    // Clear image cache on critical memory
+    imageService.clearCache();
+  });
+  
+  memoryMonitor.start();
+  
   // Try to initialize queue manager (optional - works without Redis)
   await queueManager.initialize();
   
@@ -426,6 +526,8 @@ async function init() {
   
   console.log('[Bot] PDD Trainer Bot is running!');
   console.log(`[Bot] Session TTL: ${SESSION_TTL} minutes`);
+  console.log(`[Bot] Max sessions: ${MAX_SESSIONS}`);
+  console.log(`[Bot] Rate limit: ${RATE_LIMIT_REQUESTS} requests per ${RATE_LIMIT_WINDOW_MS / 1000} seconds`);
   console.log('[Bot] Press Ctrl+C to stop');
 }
 
